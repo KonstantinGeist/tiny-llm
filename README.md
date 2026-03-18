@@ -1,6 +1,6 @@
-Простая реализация инференса модели Qwen2.5-0.5B-Instruct на чистом C. Опциональное ускорение через OpenBLAS (12 ток/сек на Intel Core i7)
+Простая реализация инференса модели Qwen3-1.7B-Instruct на чистом C. Опциональное ускорение через OpenBLAS (3 ток/сек на Intel Core i7)
 
-См. папку `doc/` для объяснения формата GGUF и архитектуры модели Qwen2.5
+См. папку `doc/` для объяснения формата GGUF и архитектуры модели Qwen3
 
 Пример:
 ```
@@ -35,7 +35,7 @@ make BLAS=1
 
 ### Веса моделей
 
-Можно скачать отсюда: https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/blob/main/Qwen2.5-0.5B-Instruct-f16.gguf
+Можно скачать отсюда: https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf
 
 Модель довольно примитивная, хорошо общается только на английском.
 
