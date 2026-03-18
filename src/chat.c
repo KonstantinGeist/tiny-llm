@@ -30,16 +30,26 @@ static void push(ChatHistory *h, ChatRole role, const char *content) {
     h->len++;
 }
 
-void chat_init(ChatHistory *h, const char *system_prompt) {
-    h->msgs = NULL;
-    h->len  = 0;
-    h->cap  = 0;
+void chat_init(ChatHistory *h, const char *system_prompt, int think) {
+    h->msgs  = NULL;
+    h->len   = 0;
+    h->cap   = 0;
+    h->think = think;
     if (system_prompt && system_prompt[0])
         push(h, ROLE_SYSTEM, system_prompt);
 }
 
 void chat_append(ChatHistory *h, ChatRole role, const char *content) {
-    push(h, role, content);
+    if (role == ROLE_USER && !h->think) {
+        // Добавляем /nothink перед сообщением, чтобы отключить режим размышлений.
+        size_t n = strlen("/nothink ") + strlen(content) + 1;
+        char  *s = malloc(n);
+        snprintf(s, n, "/nothink %s", content);
+        push(h, role, s);
+        free(s);
+    } else {
+        push(h, role, content);
+    }
 }
 
 char *chat_format_delta(const ChatHistory *h, int from_msg,

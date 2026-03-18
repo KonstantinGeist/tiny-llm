@@ -190,8 +190,12 @@ static int read_user_input(char *buf, int maxlen) {
 
 int main(int argc, char **argv) {
     const char *model_path = NULL;
+    int         think_mode = 0; // по умолчанию — без размышлений
+
     for (int i = 1; i < argc; i++) {
-        if (!model_path) {
+        if (strcmp(argv[i], "--think") == 0) {
+            think_mode = 1;
+        } else if (!model_path) {
             model_path = argv[i];
         } else {
             fprintf(stderr, "ошибка: неизвестный аргумент '%s'\n", argv[i]);
@@ -199,7 +203,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!model_path) {
-        fprintf(stderr, "Использование: %s <model.gguf>\n", argv[0]);
+        fprintf(stderr, "Использование: %s [--think] <model.gguf>\n", argv[0]);
         return 1;
     }
 
@@ -208,18 +212,18 @@ int main(int argc, char **argv) {
     Engine *e = engine_load(model_path);
     if (!e) { fprintf(stderr, "завершилось с ошибкой.\n"); return 1; }
 
-    fprintf(stderr, "Чат с Qwen3-1.7B-Instruct (нажмите Esc или Ctrl-C для выхода)\n\n");
+    fprintf(stderr, "Чат с Qwen3-1.7B-Instruct (нажмите Esc или Ctrl-C для выхода)\n");
+    fprintf(stderr, "Режим размышлений: %s\n\n", think_mode ? "включён" : "выключен (--think для включения)");
 
-    // Запуск инференс-потока.
     pthread_create(&s_inf_thread, NULL, inf_thread, NULL);
 
     term_raw();
 
     ChatHistory history;
-    chat_init(&history, NULL);
+    chat_init(&history, NULL, think_mode);
 
     char     user_msg[4096];
-    ReplyBuf reply = { NULL, 0, 0 };
+    ReplyBuf reply     = { NULL, 0, 0 };
     int      sent_msgs = 0;
 
     for (;;) {

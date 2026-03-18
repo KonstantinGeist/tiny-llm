@@ -19,9 +19,10 @@ typedef struct {
     ChatMessage *msgs;
     int          len;
     int          cap;
+    int          think;
 } ChatHistory;
 
-void chat_init(ChatHistory *h, const char *system_prompt);
+void chat_init(ChatHistory *h, const char *system_prompt, int think);
 
 void chat_append(ChatHistory *h, ChatRole role, const char *content);
 
