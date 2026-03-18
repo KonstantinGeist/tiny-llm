@@ -24,12 +24,11 @@ typedef struct {
     float *token_embd;            /* [vocab_size, d_model] */
     struct {
         float *attn_norm;         /* [d_model]             */
-        float *attn_q_w;          /* [d_model, d_model]    */
-        float *attn_q_b;          /* [d_model]             */
+        float *attn_q_w;          /* [n_heads_q * head_dim, d_model] */
+        float *attn_q_norm;       /* [head_dim]  — RMSNorm на Q-головах (Qwen3) */
         float *attn_k_w;          /* [n_kv_dim, d_model]   */
-        float *attn_k_b;          /* [n_kv_dim]            */
+        float *attn_k_norm;       /* [head_dim]  — RMSNorm на K-головах (Qwen3) */
         float *attn_v_w;          /* [n_kv_dim, d_model]   */
-        float *attn_v_b;          /* [n_kv_dim]            */
         float *attn_out_w;        /* [d_model, d_model]    */
         float *ffn_norm;          /* [d_model]             */
         float *ffn_gate_w;        /* [d_ff, d_model]       */
@@ -71,6 +70,16 @@ struct Engine {
     double gen_ms;
 };
 
+// Применяет RMSNorm поголовно к вектору v размера (n_heads × head_dim),
+// используя один набор весов w размера head_dim.
+static void rms_norm_heads(float *v, int n_heads, int head_dim,
+                            const float *w, float eps) {
+    for (int h = 0; h < n_heads; h++) {
+        float *vh = v + h * head_dim;
+        rms_norm(vh, vh, w, head_dim, eps);
+    }
+}
+
 // Выполняет forward pass для одного токена в позиции pos
 // и возвращает указатель на логиты по всему словарю.
 static float *forward(Engine *e, int token, int pos) {
@@ -96,9 +105,14 @@ static float *forward(Engine *e, int token, int pos) {
         rms_norm(s->xb, s->x, w->layer[l].attn_norm, dm, cfg->rms_norm_eps);
 
         // Строим Q, K и V из нормализованного состояния.
-        linear_layer(s->q,     w->layer[l].attn_q_w, s->xb, w->layer[l].attn_q_b, dm, dm);
-        linear_layer(s->k_cur, w->layer[l].attn_k_w, s->xb, w->layer[l].attn_k_b, dm, nkv_d);
-        linear_layer(s->v_cur, w->layer[l].attn_v_w, s->xb, w->layer[l].attn_v_b, dm, nkv_d);
+        // В Qwen3 у Q/K/V нет векторов смещений (bias = NULL).
+        linear_layer(s->q,     w->layer[l].attn_q_w, s->xb, NULL, dm, nq  * hd);
+        linear_layer(s->k_cur, w->layer[l].attn_k_w, s->xb, NULL, dm, nkv_d);
+        linear_layer(s->v_cur, w->layer[l].attn_v_w, s->xb, NULL, dm, nkv_d);
+
+        // Qwen3: нормализуем Q и K поголовно перед RoPE.
+        rms_norm_heads(s->q,     nq,  hd, w->layer[l].attn_q_norm, cfg->rms_norm_eps);
+        rms_norm_heads(s->k_cur, nkv, hd, w->layer[l].attn_k_norm, cfg->rms_norm_eps);
 
         // Применяем rotary positional embedding к Q и K
         // для учета позиции токена в последовательности.
@@ -192,19 +206,20 @@ Engine *engine_load(const char *model_path) {
     // Извлекаем гиперпараметры из метаданных.
     Config *c = &e->cfg;
 #define U32(k) ((int)gguf_get_val(ctx, k)->uint32)
-    c->d_model     = U32("qwen2.embedding_length");
-    c->n_layers    = U32("qwen2.block_count");
-    c->n_heads_q   = U32("qwen2.attention.head_count");
-    c->n_heads_kv  = U32("qwen2.attention.head_count_kv");
-    c->d_ff        = U32("qwen2.feed_forward_length");
-    c->max_seq_len = U32("qwen2.context_length");
+    c->d_model     = U32("qwen3.embedding_length");
+    c->n_layers    = U32("qwen3.block_count");
+    c->n_heads_q   = U32("qwen3.attention.head_count");
+    c->n_heads_kv  = U32("qwen3.attention.head_count_kv");
+    c->d_ff        = U32("qwen3.feed_forward_length");
+    c->max_seq_len = U32("qwen3.context_length");
+    c->head_dim    = U32("qwen3.attention.key_length");
 #undef U32
-    c->head_dim       = c->d_model / c->n_heads_q;
     c->vocab_size     = (int)gguf_get_val(ctx, "tokenizer.ggml.tokens")->array.len;
-    c->rope_freq_base = gguf_get_val(ctx, "qwen2.rope.freq_base")->float32;
-    c->rms_norm_eps   = gguf_get_val(ctx, "qwen2.attention.layer_norm_rms_epsilon")->float32;
+    c->rope_freq_base = gguf_get_val(ctx, "qwen3.rope.freq_base")->float32;
+    c->rms_norm_eps   = gguf_get_val(ctx, "qwen3.attention.layer_norm_rms_epsilon")->float32;
 
     // Загружаем веса в наши float32-буферы.
+    // Все матричные тензоры в модели имеют тип Q8_0 — деквантизируем в float32.
     int fd = open(model_path, O_RDONLY);
     struct stat st; fstat(fd, &st);
     uint8_t *base = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -213,28 +228,28 @@ Engine *engine_load(const char *model_path) {
     Weights *w = &e->w;
     char name[128];
     int dm = c->d_model, dff = c->d_ff, nkv_d = c->n_heads_kv * c->head_dim;
+    int nq_d = c->n_heads_q * c->head_dim;
 
-    w->token_embd  = copy_f16(gguf_tensor_ptr(ctx, base, "token_embd.weight"), (size_t)c->vocab_size * dm);
+    w->token_embd  = copy_q8_0(gguf_tensor_ptr(ctx, base, "token_embd.weight"), (size_t)c->vocab_size * dm);
     w->output_norm = copy_f32(gguf_tensor_ptr(ctx, base, "output_norm.weight"), dm);
 
     for (int l = 0; l < c->n_layers; l++) {
-#define TF16(f, fmt, n) snprintf(name, sizeof(name), fmt, l); \
-                        w->layer[l].f = copy_f16(gguf_tensor_ptr(ctx, base, name), n)
+#define TQ8(f, fmt, n) snprintf(name, sizeof(name), fmt, l); \
+                        w->layer[l].f = copy_q8_0(gguf_tensor_ptr(ctx, base, name), n)
 #define TF32(f, fmt, n) snprintf(name, sizeof(name), fmt, l); \
                         w->layer[l].f = copy_f32(gguf_tensor_ptr(ctx, base, name), n)
-        TF32(attn_norm,  "blk.%d.attn_norm.weight",   dm);
-        TF16(attn_q_w,   "blk.%d.attn_q.weight",      (size_t)dm    * dm);
-        TF32(attn_q_b,   "blk.%d.attn_q.bias",        dm);
-        TF16(attn_k_w,   "blk.%d.attn_k.weight",      (size_t)nkv_d * dm);
-        TF32(attn_k_b,   "blk.%d.attn_k.bias",        nkv_d);
-        TF16(attn_v_w,   "blk.%d.attn_v.weight",      (size_t)nkv_d * dm);
-        TF32(attn_v_b,   "blk.%d.attn_v.bias",        nkv_d);
-        TF16(attn_out_w, "blk.%d.attn_output.weight", (size_t)dm    * dm);
-        TF32(ffn_norm,   "blk.%d.ffn_norm.weight",    dm);
-        TF16(ffn_gate_w, "blk.%d.ffn_gate.weight",    (size_t)dff   * dm);
-        TF16(ffn_up_w,   "blk.%d.ffn_up.weight",      (size_t)dff   * dm);
-        TF16(ffn_down_w, "blk.%d.ffn_down.weight",    (size_t)dm    * dff);
-#undef TF16
+        TF32(attn_norm,   "blk.%d.attn_norm.weight",   dm);
+        TQ8 (attn_q_w,    "blk.%d.attn_q.weight",      (size_t)nq_d  * dm);
+        TF32(attn_q_norm, "blk.%d.attn_q_norm.weight", c->head_dim);
+        TQ8 (attn_k_w,    "blk.%d.attn_k.weight",      (size_t)nkv_d * dm);
+        TF32(attn_k_norm, "blk.%d.attn_k_norm.weight", c->head_dim);
+        TQ8 (attn_v_w,    "blk.%d.attn_v.weight",      (size_t)nkv_d * dm);
+        TQ8 (attn_out_w,  "blk.%d.attn_output.weight", (size_t)dm    * dm);
+        TF32(ffn_norm,    "blk.%d.ffn_norm.weight",    dm);
+        TQ8 (ffn_gate_w,  "blk.%d.ffn_gate.weight",    (size_t)dff   * dm);
+        TQ8 (ffn_up_w,    "blk.%d.ffn_up.weight",      (size_t)dff   * dm);
+        TQ8 (ffn_down_w,  "blk.%d.ffn_down.weight",    (size_t)dm    * dff);
+#undef TQ8
 #undef TF32
     }
 
@@ -242,12 +257,12 @@ Engine *engine_load(const char *model_path) {
 
     if (!w->token_embd || !w->output_norm) { engine_free(e); return NULL; }
     for (int l = 0; l < c->n_layers; l++) {
-        if (!w->layer[l].attn_norm  || !w->layer[l].attn_q_w  ||
-            !w->layer[l].attn_q_b   || !w->layer[l].attn_k_w  ||
-            !w->layer[l].attn_k_b   || !w->layer[l].attn_v_w  ||
-            !w->layer[l].attn_v_b   || !w->layer[l].attn_out_w ||
-            !w->layer[l].ffn_norm   || !w->layer[l].ffn_gate_w ||
-            !w->layer[l].ffn_up_w   || !w->layer[l].ffn_down_w) {
+        if (!w->layer[l].attn_norm   || !w->layer[l].attn_q_w   ||
+            !w->layer[l].attn_q_norm || !w->layer[l].attn_k_w   ||
+            !w->layer[l].attn_k_norm || !w->layer[l].attn_v_w   ||
+            !w->layer[l].attn_out_w  || !w->layer[l].ffn_norm   ||
+            !w->layer[l].ffn_gate_w  || !w->layer[l].ffn_up_w   ||
+            !w->layer[l].ffn_down_w) {
             engine_free(e); return NULL;
         }
     }
@@ -348,11 +363,10 @@ void engine_free(Engine *e) {
     for (int l = 0; l < e->cfg.n_layers; l++) {
         free(e->w.layer[l].attn_norm);
         free(e->w.layer[l].attn_q_w);
-        free(e->w.layer[l].attn_q_b);
+        free(e->w.layer[l].attn_q_norm);
         free(e->w.layer[l].attn_k_w);
-        free(e->w.layer[l].attn_k_b);
+        free(e->w.layer[l].attn_k_norm);
         free(e->w.layer[l].attn_v_w);
-        free(e->w.layer[l].attn_v_b);
         free(e->w.layer[l].attn_out_w);
         free(e->w.layer[l].ffn_norm);
         free(e->w.layer[l].ffn_gate_w);
@@ -360,7 +374,7 @@ void engine_free(Engine *e) {
         free(e->w.layer[l].ffn_down_w);
     }
 
-    // состояне инференса
+    // состояние инференса
     free(e->s.x); free(e->s.xb); free(e->s.q);
     free(e->s.k_cur); free(e->s.v_cur);
     free(e->s.attn); free(e->s.attn_out);

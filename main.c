@@ -1,4 +1,4 @@
-// Интерактивный CLI для запуска инференса модели Qwen2.5
+// Интерактивный CLI для запуска инференса модели Qwen3
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
     Engine *e = engine_load(model_path);
     if (!e) { fprintf(stderr, "завершилось с ошибкой.\n"); return 1; }
 
-    fprintf(stderr, "Чат с Qwen2.5-0.5B-Instruct (нажмите Esc или Ctrl-C для выхода)\n\n");
+    fprintf(stderr, "Чат с Qwen3-1.7B-Instruct (нажмите Esc или Ctrl-C для выхода)\n\n");
 
     // Запуск инференс-потока.
     pthread_create(&s_inf_thread, NULL, inf_thread, NULL);

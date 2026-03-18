@@ -1,6 +1,6 @@
 #pragma once
 
-// Ядро инференса модели Qwen2.5
+// Ядро инференса модели Qwen3
 
 #include <stdint.h>
 #include "gguf.h"
