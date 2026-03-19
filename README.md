@@ -7,6 +7,10 @@
 >> what is the capital of France?
 
 The capital of France is Paris.
+
+>> Столица Франции?
+
+Столица Франции — это **Париж**.
 ```
 
 ---
@@ -31,13 +35,13 @@ make BLAS=1
 
 Требуется OpenBLAS (`libopenblas-dev` на Debian/Ubuntu, `openblas` на Arch/Homebrew).
 
+Также требуется nvidia-cuda-toolkit
+
 ---
 
 ### Веса моделей
 
 Можно скачать отсюда: https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf
-
-Модель довольно примитивная, хорошо общается только на английском.
 
 ---
 
