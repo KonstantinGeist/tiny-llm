@@ -40,26 +40,28 @@ void chat_init(ChatHistory *h, const char *system_prompt, int think) {
 }
 
 void chat_append(ChatHistory *h, ChatRole role, const char *content) {
-    if (role == ROLE_USER && !h->think) {
-        // Добавляем /nothink перед сообщением, чтобы отключить режим размышлений.
-        size_t n = strlen("/nothink ") + strlen(content) + 1;
-        char  *s = malloc(n);
-        snprintf(s, n, "/nothink %s", content);
-        push(h, role, s);
-        free(s);
-    } else {
-        push(h, role, content);
-    }
+    push(h, role, content);
 }
 
 char *chat_format_delta(const ChatHistory *h, int from_msg,
                         int close_prev, int add_generation_prompt) {
+    // В режиме без размышлений добавляем /nothink ровно к первому user-сообщению
+    // в истории. Оно попадает в KV-кэш один раз и задаёт режим на всю сессию.
+    int first_user = -1;
+    if (!h->think) {
+        for (int i = 0; i < h->len; i++) {
+            if (h->msgs[i].role == ROLE_USER) { first_user = i; break; }
+        }
+    }
+
     size_t need = 1; // NUL-терминатор
     if (close_prev)
         need += strlen("<|im_end|>\n");
     for (int i = from_msg; i < h->len; i++) {
+        size_t prefix_len = (i == first_user) ? strlen("/no_think ") : 0;
         need += strlen("<|im_start|>") + strlen(role_name(h->msgs[i].role))
               + 1  /* \n */
+              + prefix_len
               + strlen(h->msgs[i].content)
               + strlen("<|im_end|>")
               + 1; /* \n */
@@ -74,8 +76,10 @@ char *chat_format_delta(const ChatHistory *h, int from_msg,
     if (close_prev)
         p += sprintf(p, "<|im_end|>\n");
     for (int i = from_msg; i < h->len; i++) {
-        p += sprintf(p, "<|im_start|>%s\n%s<|im_end|>\n",
+        const char *prefix = (i == first_user) ? "/no_think " : "";
+        p += sprintf(p, "<|im_start|>%s\n%s%s<|im_end|>\n",
                      role_name(h->msgs[i].role),
+                     prefix,
                      h->msgs[i].content);
     }
     if (add_generation_prompt)

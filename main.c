@@ -61,13 +61,66 @@ static void reply_append(ReplyBuf *r, const char *piece) {
     r->buf[r->len] = '\0';
 }
 
+typedef struct {
+    ReplyBuf   *reply;
+    int         think_mode;
+    int         printing;
+    int         skip_newline;
+    char        tail[16];
+    int         tail_len;
+} TokenCbCtx;
+
 // Коллбэк тоенов: печатает каждый токен, добавляет его в буфер ответа.
+// В режиме с выключенным мышлением вырезает тэги <think></nothink> из ответа в терминале.
 static int token_cb(Engine *e, int token_id, void *ctx) {
     if (atomic_load(&stop_requested)) return 1;
     const char *piece = engine_decode_token(e, token_id);
-    fputs(piece, stdout);
-    fflush(stdout);
-    reply_append((ReplyBuf *)ctx, piece);
+    TokenCbCtx *c = (TokenCbCtx *)ctx;
+
+    reply_append(c->reply, piece);
+
+    if (c->think_mode || c->printing) {
+        const char *out = piece;
+        if (c->skip_newline) {
+            while (*out == ' ' || *out == '\n' || *out == '\r' || *out == '\t') out++;
+            if (*out) c->skip_newline = 0;
+        }
+        if (*out) { fputs(out, stdout); fflush(stdout); }
+        return 0;
+    }
+
+    const char *tag     = "</think>";
+    int         tag_len = (int)strlen(tag);
+
+    int plen = (int)strlen(piece);
+    int keep = tag_len - 1;
+    if (keep > c->tail_len) keep = c->tail_len;
+
+    char window[32 + 16];
+    memcpy(window, c->tail + c->tail_len - keep, keep);
+    memcpy(window + keep, piece, plen);
+    window[keep + plen] = '\0';
+
+    if (strstr(window, tag)) {
+        c->printing = 1;
+        c->skip_newline = 1;
+        const char *after = strstr(window, tag) + tag_len;
+        int offset = (int)(after - window) - keep;
+        if (offset < 0) offset = 0;
+        while (offset < plen &&
+               (piece[offset] == ' '  || piece[offset] == '\n' ||
+                piece[offset] == '\r' || piece[offset] == '\t')) offset++;
+        if (offset < plen) {
+            c->skip_newline = 0;
+            fputs(piece + offset, stdout);
+            fflush(stdout);
+        }
+    }
+
+    int new_tail = plen < keep ? plen : keep;
+    memmove(c->tail, piece + plen - new_tail, new_tail);
+    c->tail_len = new_tail;
+
     return 0;
 }
 
@@ -75,8 +128,8 @@ static int token_cb(Engine *e, int token_id, void *ctx) {
 
 typedef struct {
     Engine     *engine;
-    const char *prompt;  // сформатированная строка в формате ChatML, время жизни управляется вызывающим кодом
-    ReplyBuf   *reply;
+    const char *prompt;
+    TokenCbCtx *cb_ctx;
 } GenArgs;
 
 static pthread_t       s_inf_thread;
@@ -109,7 +162,7 @@ static void *inf_thread(void *arg) {
         pthread_mutex_unlock(&s_job_mutex);
 
         // Запускаем инференс
-        engine_generate(a->engine, a->prompt, token_cb, a->reply);
+        engine_generate(a->engine, a->prompt, token_cb, a->cb_ctx);
 
         pthread_mutex_lock(&s_job_mutex);
         s_job_running = 0;
@@ -242,14 +295,15 @@ int main(int argc, char **argv) {
 
         // Запуск задачу на инференс-потоке.
         atomic_store(&stop_requested, 0);
-        GenArgs args = { e, prompt, &reply };
+        TokenCbCtx cb_ctx = { &reply, think_mode, think_mode, 0, {0}, 0 };
+        GenArgs args = { e, prompt, &cb_ctx };
         run_job(&args);
         free(prompt);
 
         // Выйти, если пользователь нажал Escape.
         if (atomic_load(&stop_requested)) break;
 
-        // Записать ответ ассистента в историю чата, для полного контекста.
+        // Записать ответ ассистента в историю чата.
         if (reply.buf && reply.len > 0) {
             chat_append(&history, ROLE_ASSISTANT, reply.buf);
             sent_msgs = history.len;
