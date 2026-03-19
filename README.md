@@ -7,6 +7,10 @@
 >> what is the capital of France?
 
 The capital of France is Paris.
+
+>> Столица Франции?
+
+Столица Франции — это **Париж**.
 ```
 
 ---
