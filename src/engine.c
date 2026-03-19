@@ -1,6 +1,7 @@
 #include "engine.h"
 #include "tokenizer.h"
 
+#include <immintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,12 +67,6 @@ static inline q8_0_mat_t make_q8_mat(const void *ptr, int d_out, int d_in) {
     return m;
 }
 
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
-
-#ifdef __AVX2__
-
 static inline float hsum256(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -111,10 +106,7 @@ static inline __m256 exp256(__m256 x) {
     return _mm256_mul_ps(p, _mm256_castsi256_ps(pw2));
 }
 
-#endif // __AVX2__
-
 static void rms_norm(float *out, const float *x, const float *w, int n, float eps) {
-#ifdef __AVX2__
     __m256 acc = _mm256_setzero_ps();
     int i = 0;
     for (; i <= n - 8; i += 8) {
@@ -131,16 +123,9 @@ static void rms_norm(float *out, const float *x, const float *w, int n, float ep
             _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(w + i),
                                         _mm256_loadu_ps(x + i)), sc));
     for (; i < n; i++) out[i] = w[i] * x[i] * ss;
-#else
-    float ss = 0.f;
-    for (int i = 0; i < n; i++) ss += x[i] * x[i];
-    ss = 1.f / sqrtf(ss / (float)n + eps);
-    for (int i = 0; i < n; i++) out[i] = w[i] * x[i] * ss;
-#endif
 }
 
 static void softmax(float *x, int n) {
-#ifdef __AVX2__
     __m256 vmx = _mm256_set1_ps(x[0]);
     int i = 0;
     for (; i <= n - 8; i += 8)
@@ -165,17 +150,9 @@ static void softmax(float *x, int n) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
     float inv = 1.f / s;
     for (; i < n; i++) x[i] *= inv;
-#else
-    float mx = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
-    float s = 0.f;
-    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-#endif
 }
 
 static int argmax(const float *v, int n) {
-#ifdef __AVX2__
     __m256 vmx = _mm256_loadu_ps(v);
     int i = 8;
     for (; i <= n - 8; i += 8)
@@ -184,21 +161,15 @@ static int argmax(const float *v, int n) {
     for (; i < n; i++) if (v[i] > mx) mx = v[i];
     for (int j = 0; j < n; j++) if (v[j] == mx) return j;
     return 0;
-#else
-    int best = 0;
-    for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
-    return best;
-#endif
 }
 
 static inline float dot_q8_f32(const q8_0_block_t *row, const float *x, int nb) {
-#ifdef __AVX2__
     __m256 acc = _mm256_setzero_ps();
     for (int b = 0; b < nb; b++) {
         __m256 vsc = _mm256_set1_ps(f16_to_f32(row[b].scale));
         const int8_t *qs = row[b].qs;
-        __m128i q8_lo = _mm_loadu_si128((const __m128i *)(qs));
-        __m128i q8_hi = _mm_loadu_si128((const __m128i *)(qs + 16));
+        __m128i q8_lo  = _mm_loadu_si128((const __m128i *)(qs));
+        __m128i q8_hi  = _mm_loadu_si128((const __m128i *)(qs + 16));
         __m256i q16_lo = _mm256_cvtepi8_epi16(q8_lo);
         __m256i q16_hi = _mm256_cvtepi8_epi16(q8_hi);
         __m256 qf0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(q16_lo)));
@@ -212,15 +183,6 @@ static inline float dot_q8_f32(const q8_0_block_t *row, const float *x, int nb) 
         acc = _mm256_fmadd_ps(vsc, dot, acc);
     }
     return hsum256(acc);
-#else
-    float s = 0.f;
-    for (int b = 0; b < nb; b++) {
-        float sc = f16_to_f32(row[b].scale);
-        for (int i = 0; i < 32; i++)
-            s += sc * (float)row[b].qs[i] * x[b * 32 + i];
-    }
-    return s;
-#endif
 }
 
 static void gemv_q8(float *y, const q8_0_mat_t *W, const float *x,
@@ -398,9 +360,7 @@ static void par_gemv(float *y, const q8_0_mat_t *W, const float *x) {
     tp_run(gemv_worker, &a);
 }
 
-typedef struct {
-    float *out; const q8_0_mat_t *gate_W, *up_W; const float *x;
-} SwigluArg;
+typedef struct { float *out; const q8_0_mat_t *gate_W, *up_W; const float *x; } SwigluArg;
 
 static void swiglu_worker(void *p, int tid, int nt) {
     SwigluArg *a = (SwigluArg *)p;
@@ -437,10 +397,10 @@ typedef struct {
 } AttnArg;
 
 static void attn_worker(void *p, int tid, int nt) {
-    AttnArg      *a   = (AttnArg *)p;
-    const Config *cfg = a->cfg;
-    const KVCache *kv = a->kv;
-    RunState     *s   = a->s;
+    AttnArg       *a   = (AttnArg *)p;
+    const Config  *cfg = a->cfg;
+    const KVCache *kv  = a->kv;
+    RunState      *s   = a->s;
     int l = a->layer, pos = a->pos;
     int nq    = cfg->n_heads_q, nkv = cfg->n_heads_kv;
     int hd    = cfg->head_dim,  nkv_d = nkv * hd;
@@ -450,22 +410,17 @@ static void attn_worker(void *p, int tid, int nt) {
 
     for (int h = h_lo; h < h_hi; h++) {
         int    kv_h   = h / group;
-        float *qh     = s->q   + h * hd;
+        float *qh     = s->q    + h * hd;
         float *scores = s->attn + h * cfg->max_seq_len;
 
         for (int t = 0; t <= pos; t++) {
             const float *kt = kv->k + ((size_t)l * cfg->max_seq_len + t) * nkv_d + kv_h * hd;
-#ifdef __AVX2__
             __m256 acc = _mm256_setzero_ps();
             int i = 0;
             for (; i <= hd - 8; i += 8)
                 acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i), _mm256_loadu_ps(kt + i), acc);
             float dot = hsum256(acc);
             for (; i < hd; i++) dot += qh[i] * kt[i];
-#else
-            float dot = 0.f;
-            for (int i = 0; i < hd; i++) dot += qh[i] * kt[i];
-#endif
             scores[t] = dot * scale;
         }
         softmax(scores, pos + 1);
@@ -474,17 +429,12 @@ static void attn_worker(void *p, int tid, int nt) {
         memset(oh, 0, hd * sizeof(float));
         for (int t = 0; t <= pos; t++) {
             const float *vt = kv->v + ((size_t)l * cfg->max_seq_len + t) * nkv_d + kv_h * hd;
-            float sc = scores[t];
-#ifdef __AVX2__
-            __m256 vs = _mm256_set1_ps(sc);
+            __m256 vs = _mm256_set1_ps(scores[t]);
             int i = 0;
             for (; i <= hd - 8; i += 8)
                 _mm256_storeu_ps(oh + i,
                     _mm256_fmadd_ps(vs, _mm256_loadu_ps(vt + i), _mm256_loadu_ps(oh + i)));
-            for (; i < hd; i++) oh[i] += sc * vt[i];
-#else
-            for (int i = 0; i < hd; i++) oh[i] += sc * vt[i];
-#endif
+            for (; i < hd; i++) oh[i] += scores[t] * vt[i];
         }
     }
 }
@@ -532,28 +482,20 @@ static float *forward(Engine *e, int token, int pos) {
         tp_run(attn_worker, &aa);
 
         par_gemv(s->tmp, &w->layer[l].attn_out_w, s->attn_out);
-#ifdef __AVX2__
-        { int i = 0;
-          for (; i <= dm - 8; i += 8)
-              _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i),
-                                                        _mm256_loadu_ps(s->tmp + i)));
-          for (; i < dm; i++) s->x[i] += s->tmp[i]; }
-#else
-        for (int i = 0; i < dm; i++) s->x[i] += s->tmp[i];
-#endif
+        int i = 0;
+        for (; i <= dm - 8; i += 8)
+            _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i),
+                                                      _mm256_loadu_ps(s->tmp + i)));
+        for (; i < dm; i++) s->x[i] += s->tmp[i];
 
         rms_norm(s->xb, s->x, w->layer[l].ffn_norm, dm, cfg->rms_norm_eps);
         par_swiglu(s->ffn_out, &w->layer[l].ffn_gate_w, &w->layer[l].ffn_up_w, s->xb);
         par_gemv(s->tmp, &w->layer[l].ffn_down_w, s->ffn_out);
-#ifdef __AVX2__
-        { int i = 0;
-          for (; i <= dm - 8; i += 8)
-              _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i),
-                                                        _mm256_loadu_ps(s->tmp + i)));
-          for (; i < dm; i++) s->x[i] += s->tmp[i]; }
-#else
-        for (int i = 0; i < dm; i++) s->x[i] += s->tmp[i];
-#endif
+        i = 0;
+        for (; i <= dm - 8; i += 8)
+            _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i),
+                                                      _mm256_loadu_ps(s->tmp + i)));
+        for (; i < dm; i++) s->x[i] += s->tmp[i];
     }
 
     rms_norm(s->xb, s->x, w->output_norm, dm, cfg->rms_norm_eps);
@@ -657,14 +599,9 @@ Engine *engine_load(const char *model_path) {
     kv->k = calloc(1, kvsz);
     kv->v = calloc(1, kvsz);
 
-    {
-        int nt = 1;
-#ifdef _SC_NPROCESSORS_ONLN
-        nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
-        if (nt < 1) nt = 1;
-#endif
-        tp_init(nt);
-    }
+    int nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nt < 1) nt = 1;
+    tp_init(nt);
 
     e->pos = 0;
     return e;
