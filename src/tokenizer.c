@@ -5,7 +5,55 @@
 #include <string.h>
 #include <stdint.h>
 
-// Специальные токены, длинные впереди.
+static int byte_to_unicode(unsigned char b) {
+    if (b >= 33 && b <= 126) return b;
+    if (b >= 161 && b <= 172) return b;
+    if (b >= 174) return b;
+    int n = 0;
+    for (int i = 0; i < 256; i++) {
+        int is_printable = (i >= 33 && i <= 126) ||
+                           (i >= 161 && i <= 172) ||
+                           (i >= 174 && i <= 255);
+        if (!is_printable) {
+            if (i == (int)b) return 256 + n;
+            n++;
+        }
+    }
+    return b; // unreachable
+}
+
+static int encode_utf8(uint32_t cp, char *buf) {
+    if (cp < 0x80)        { buf[0] = (char)cp; return 1; }
+    if (cp < 0x800)       { buf[0] = (char)(0xC0 | (cp >> 6));
+                            buf[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000)     { buf[0] = (char)(0xE0 | (cp >> 12));
+                            buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            buf[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+                            buf[0] = (char)(0xF0 | (cp >> 18));
+                            buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            buf[3] = (char)(0x80 | (cp & 0x3F)); return 4;
+}
+
+static int decode_utf8(const unsigned char *s, uint32_t *cp) {
+    if (s[0] < 0x80)                          { *cp = s[0]; return 1; }
+    if ((s[0] & 0xE0) == 0xC0)                { *cp = ((s[0] & 0x1F) << 6)  | (s[1] & 0x3F); return 2; }
+    if ((s[0] & 0xF0) == 0xE0)                { *cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); return 3; }
+                                                *cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); return 4;
+}
+
+static int16_t s_u2b[512];
+static int    s_u2b_ready = 0;
+
+static void build_u2b(void) {
+    for (int i = 0; i < 512; i++) s_u2b[i] = -1;
+    for (int b = 0; b < 256; b++) {
+        int cp = byte_to_unicode((unsigned char)b);
+        if (cp < 512) s_u2b[cp] = (int16_t)b;
+    }
+    s_u2b_ready = 1;
+}
+
 static const char *SPECIAL[] = {
     "<|im_start|>", "<|im_end|>", "<|endoftext|>", NULL
 };
@@ -26,22 +74,18 @@ void tok_init(Tokenizer *t,
     t->merge_map = hm_new();
     for (int i = 0; i < n_merges; i++)
         hm_put(&t->merge_map, merges[i], i);
+
+    if (!s_u2b_ready) build_u2b();
 }
 
 int tok_encode(const Tokenizer *t, const char *text, int *out) {
-    // Предобработка: заменить голые байты их аналогами  в GPT.
-    // В данный момент поддерживается только \n → Ċ для ChatML.
     size_t raw_len = strlen(text);
-    char *norm = malloc(raw_len * 2 + 1);
+    char *norm = malloc(raw_len * 4 + 1);
     int nlen = 0;
     for (size_t i = 0; i < raw_len; i++) {
         unsigned char c = (unsigned char)text[i];
-        if (c == '\n') {
-            norm[nlen++] = (char)0xC4;
-            norm[nlen++] = (char)0x8A;  /* Ċ */
-        } else {
-            norm[nlen++] = (char)c;
-        }
+        int cp = byte_to_unicode(c);
+        nlen += encode_utf8((uint32_t)cp, norm + nlen);
     }
     norm[nlen] = '\0';
 
@@ -92,7 +136,6 @@ int tok_encode(const Tokenizer *t, const char *text, int *out) {
 
     free(norm);
 
-    // Слияния BPE: последовательно применяем слияние соседних пар с наименьшим рангом
     char pair[256];
     int changed = 1;
     while (changed) {
@@ -129,26 +172,18 @@ int tok_encode(const Tokenizer *t, const char *text, int *out) {
 const char *tok_decode(const Tokenizer *t, int token_id) {
     static char buf[512];
     const char *piece = t->vocab[token_id];
-    // Конвертация GPT-символов в стандартные:
-    //   Ġ (0xC4 0xA0) → ' '
-    //   Ċ (0xC4 0x8A) → '\n'
-    int has_escape = 0;
-    for (const char *p = piece; *p; p++) {
-        if ((unsigned char)p[0] == 0xC4 &&
-                ((unsigned char)p[1] == 0xA0 || (unsigned char)p[1] == 0x8A)) {
-            has_escape = 1; break;
-        }
-    }
-    if (!has_escape) return piece;
 
+    const unsigned char *p = (const unsigned char *)piece;
     int out = 0;
-    for (const char *p = piece; *p && out < (int)sizeof(buf) - 1; ) {
-        if ((unsigned char)p[0] == 0xC4 && (unsigned char)p[1] == 0xA0) {
-            buf[out++] = ' '; p += 2;
-        } else if ((unsigned char)p[0] == 0xC4 && (unsigned char)p[1] == 0x8A) {
-            buf[out++] = '\n'; p += 2;
+    while (*p && out < (int)sizeof(buf) - 1) {
+        uint32_t cp;
+        int consumed = decode_utf8(p, &cp);
+        p += consumed;
+        if (cp < 512 && s_u2b[cp] >= 0) {
+            buf[out++] = (char)(uint8_t)s_u2b[cp];
         } else {
-            buf[out++] = *p++;
+            int enc = encode_utf8(cp, buf + out);
+            out += enc;
         }
     }
     buf[out] = '\0';
