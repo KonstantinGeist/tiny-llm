@@ -88,12 +88,16 @@ static inline float hmax256(__m256 v) {
 static inline __m256 exp256(__m256 x) {
     x = _mm256_min_ps(x, _mm256_set1_ps( 88.3762626647950f));
     x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647950f));
+    // n = floor(x / ln2 + 0.5) = round(x / ln2)
     __m256 z   = _mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896f),
                                      _mm256_set1_ps(0.5f));
-    __m256i n  = _mm256_cvttps_epi32(z);
-    __m256  fn = _mm256_cvtepi32_ps(n);
+    __m256  fn = _mm256_floor_ps(z);                  // fix: floor, not truncate
+    __m256i n  = _mm256_cvttps_epi32(fn);
+    // r = x - n*ln2  (two-constant Cephes reduction for accuracy)
     __m256 f   = _mm256_fnmadd_ps(fn, _mm256_set1_ps( 0.693359375f),    x);
     f           = _mm256_fnmadd_ps(fn, _mm256_set1_ps(-2.12194440e-4f), f);
+    // Minimax polynomial: exp(f) for f in [-ln2/2, ln2/2]
+    // = 1 + f + f^2*(1/2 + f*(1/6 + ...))
     __m256 p = _mm256_set1_ps(1.9875691500e-4f);
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.3981999507e-3f));
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(8.3334519073e-3f));
@@ -101,6 +105,7 @@ static inline __m256 exp256(__m256 x) {
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.6666665459e-1f));
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.0000001201e-1f));
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));  // fix: missing f^1 term
     __m256i pw2 = _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
     return _mm256_mul_ps(p, _mm256_castsi256_ps(pw2));
 }
