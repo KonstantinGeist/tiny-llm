@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -O3 -march=native -mavx2 -mfma -ffast-math \
+CFLAGS  = -std=c11 -Wall -Wextra -O3 -march=native -mavx2 -mfma \
           -funroll-loops -Isrc -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lm -lpthread
 
