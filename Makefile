@@ -1,5 +1,6 @@
 CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -O2 -Isrc -D_POSIX_C_SOURCE=200809L
+CFLAGS  = -std=c11 -Wall -Wextra -O3 -march=native -ffast-math \
+          -funroll-loops -Isrc -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lm -lpthread
 
 # Debug flags (used when DEBUG=1)
@@ -11,26 +12,12 @@ SRC = src
 OBJ = build
 BIN = bin
 
-# Core sources (always compiled)
 SRCS = main.c \
        $(SRC)/engine.c \
        $(SRC)/tokenizer.c \
        $(SRC)/gguf.c \
        $(SRC)/hashmap.c \
-       $(SRC)/chat.c \
-       $(SRC)/math_common.c \
-       $(SRC)/utils.c
-
-# Math backend selection (pick at most one):
-#   make           → math_cpu.c      (pure C, no deps)
-#   make BLAS=1    → math_openblas.c (requires -lopenblas)
-ifeq ($(BLAS),1)
-SRCS    += $(SRC)/math_openblas.c
-CFLAGS  += -DUSE_OPENBLAS
-LDFLAGS += -lopenblas
-else
-SRCS    += $(SRC)/math_cpu.c
-endif
+       $(SRC)/chat.c
 
 OBJS = $(OBJ)/main.o $(filter-out main.c,$(SRCS:$(SRC)/%.c=$(OBJ)/%.o))
 
