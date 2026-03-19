@@ -27,18 +27,6 @@ make
 
 ---
 
-### OpenBLAS (быстрее на CPU)
-
-```sh
-make BLAS=1
-```
-
-Требуется OpenBLAS (`libopenblas-dev` на Debian/Ubuntu, `openblas` на Arch/Homebrew).
-
-Также требуется nvidia-cuda-toolkit
-
----
-
 ### Веса моделей
 
 Можно скачать отсюда: https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf
