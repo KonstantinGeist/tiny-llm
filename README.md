@@ -17,7 +17,7 @@ The capital of France is Paris.
 
 ## Сборка
 
-Для сборки требуется Linux или WSL2 под Windows.
+Для сборки требуется Linux или WSL2 под Windows и nvidia-cuda-toolkit
 
 ```sh
 make
