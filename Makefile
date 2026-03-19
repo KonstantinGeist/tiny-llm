@@ -1,9 +1,17 @@
+NVCC    = nvcc
 CC      = gcc
+NVFLAGS = -std=c++17 -O3 -Isrc \
+          --generate-code arch=compute_75,code=sm_75 \
+          --generate-code arch=compute_80,code=sm_80 \
+          --generate-code arch=compute_86,code=sm_86 \
+          --generate-code arch=compute_89,code=sm_89 \
+          --generate-code arch=compute_90,code=sm_90
 CFLAGS  = -std=c11 -Wall -Wextra -O2 -Isrc -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lm -lpthread
+LDFLAGS = -lm -lpthread -lcudart
 
-# Debug flags (used when DEBUG=1)
+# Debug: make DEBUG=1
 ifeq ($(DEBUG),1)
+NVFLAGS := -std=c++17 -O0 -g -G -Isrc
 CFLAGS  := -std=c11 -Wall -Wextra -O0 -g -Isrc -D_POSIX_C_SOURCE=200809L
 endif
 
@@ -11,39 +19,36 @@ SRC = src
 OBJ = build
 BIN = bin
 
-# Core sources (always compiled)
-SRCS = main.c \
-       $(SRC)/engine.c \
-       $(SRC)/tokenizer.c \
-       $(SRC)/gguf.c \
-       $(SRC)/hashmap.c \
-       $(SRC)/chat.c \
-       $(SRC)/math_common.c \
-       $(SRC)/utils.c
+# C sources (compiled with gcc)
+C_SRCS = main.c \
+         $(SRC)/tokenizer.c \
+         $(SRC)/gguf.c \
+         $(SRC)/hashmap.c \
+         $(SRC)/chat.c \
+         $(SRC)/utils.c
 
-# Math backend selection (pick at most one):
-#   make           → math_cpu.c      (pure C, no deps)
-#   make BLAS=1    → math_openblas.c (requires -lopenblas)
-ifeq ($(BLAS),1)
-SRCS    += $(SRC)/math_openblas.c
-CFLAGS  += -DUSE_OPENBLAS
-LDFLAGS += -lopenblas
-else
-SRCS    += $(SRC)/math_cpu.c
-endif
+# CUDA source (compiled with nvcc)
+CU_SRCS = $(SRC)/engine.cu
 
-OBJS = $(OBJ)/main.o $(filter-out main.c,$(SRCS:$(SRC)/%.c=$(OBJ)/%.o))
+C_OBJS  = $(OBJ)/main.o \
+           $(patsubst $(SRC)/%.c,  $(OBJ)/%.o, $(filter $(SRC)/%, $(C_SRCS)))
+CU_OBJS = $(patsubst $(SRC)/%.cu, $(OBJ)/%.o, $(CU_SRCS))
+
+OBJS = $(C_OBJS) $(CU_OBJS)
 
 all: $(BIN)/chat
 
 $(BIN)/chat: $(OBJS) | $(BIN)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(NVCC) $(NVFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(OBJ)/main.o: main.c | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(OBJ)/%.o: $(SRC)/%.c | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(OBJ)/%.o: $(SRC)/%.cu | $(OBJ)
+	$(NVCC) $(NVFLAGS) -c -o $@ $<
 
 $(OBJ) $(BIN):
 	mkdir -p $@
