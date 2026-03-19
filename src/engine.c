@@ -101,7 +101,6 @@ static inline __m256 exp256(__m256 x) {
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.6666665459e-1f));
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.0000001201e-1f));
     p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
     __m256i pw2 = _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
     return _mm256_mul_ps(p, _mm256_castsi256_ps(pw2));
 }
@@ -196,7 +195,21 @@ static void gemv_q8_swiglu(float *out,
                             const q8_0_mat_t *gate_W, const q8_0_mat_t *up_W,
                             const float *x, int row_start, int row_end) {
     int nb = gate_W->d_in / 32;
-    for (int r = row_start; r < row_end; r++) {
+    int r = row_start;
+    for (; r <= row_end - 8; r += 8) {
+        float g[8], u[8];
+        for (int i = 0; i < 8; i++) {
+            g[i] = dot_q8_f32(gate_W->data + (size_t)(r + i) * nb, x, nb);
+            u[i] = dot_q8_f32(up_W->data   + (size_t)(r + i) * nb, x, nb);
+        }
+        __m256 vg   = _mm256_loadu_ps(g);
+        __m256 vu   = _mm256_loadu_ps(u);
+        __m256 neg_g  = _mm256_sub_ps(_mm256_setzero_ps(), vg);
+        __m256 denom  = _mm256_add_ps(_mm256_set1_ps(1.f), exp256(neg_g));
+        __m256 result = _mm256_div_ps(_mm256_mul_ps(vg, vu), denom);
+        _mm256_storeu_ps(out + r, result);
+    }
+    for (; r < row_end; r++) {
         float g = dot_q8_f32(gate_W->data + (size_t)r * nb, x, nb);
         float u = dot_q8_f32(up_W->data   + (size_t)r * nb, x, nb);
         out[r] = g / (1.f + expf(-g)) * u;
@@ -312,7 +325,7 @@ typedef struct {
         q8_0_mat_t  ffn_gate_w;
         q8_0_mat_t  ffn_up_w;
         q8_0_mat_t  ffn_down_w;
-    } layer[32];
+    } layer[28];
     float *output_norm;
 } Weights;
 
@@ -329,6 +342,8 @@ typedef struct {
     float *ffn_out;
     float *tmp;
     float *logits;
+    float *rope_cos;
+    float *rope_sin;
 } RunState;
 
 struct Engine {
@@ -360,6 +375,31 @@ static void par_gemv(float *y, const q8_0_mat_t *W, const float *x) {
     tp_run(gemv_worker, &a);
 }
 
+typedef struct {
+    float *yq, *yk, *yv;
+    const q8_0_mat_t *Wq, *Wk, *Wv;
+    const float *x;
+} QKVArg;
+
+static void qkv_worker(void *p, int tid, int nt) {
+    QKVArg *a = (QKVArg *)p;
+    /* Q rows */
+    { int lo = (tid * a->Wq->d_out) / nt, hi = ((tid+1) * a->Wq->d_out) / nt;
+      gemv_q8(a->yq, a->Wq, a->x, lo, hi); }
+    /* K rows */
+    { int lo = (tid * a->Wk->d_out) / nt, hi = ((tid+1) * a->Wk->d_out) / nt;
+      gemv_q8(a->yk, a->Wk, a->x, lo, hi); }
+    /* V rows */
+    { int lo = (tid * a->Wv->d_out) / nt, hi = ((tid+1) * a->Wv->d_out) / nt;
+      gemv_q8(a->yv, a->Wv, a->x, lo, hi); }
+}
+static void par_qkv(float *yq, float *yk, float *yv,
+                    const q8_0_mat_t *Wq, const q8_0_mat_t *Wk, const q8_0_mat_t *Wv,
+                    const float *x) {
+    QKVArg a = { yq, yk, yv, Wq, Wk, Wv, x };
+    tp_run(qkv_worker, &a);
+}
+
 typedef struct { float *out; const q8_0_mat_t *gate_W, *up_W; const float *x; } SwigluArg;
 
 static void swiglu_worker(void *p, int tid, int nt) {
@@ -377,14 +417,15 @@ static void par_swiglu(float *out,
 
 static void norm_rope_heads(float *v, int n_heads, int head_dim,
                              const float *w_norm, float eps,
-                             int pos, float freq_base) {
-    int half = head_dim / 2;
+                             int pos, const float *rope_cos, const float *rope_sin,
+                             int half) {
+    const float *cos_row = rope_cos + (size_t)pos * half;
+    const float *sin_row = rope_sin + (size_t)pos * half;
     for (int h = 0; h < n_heads; h++) {
         float *vh = v + h * head_dim;
         rms_norm(vh, vh, w_norm, head_dim, eps);
         for (int i = 0; i < half; i++) {
-            float freq = 1.f / powf(freq_base, 2.f * (float)i / (float)head_dim);
-            float c = cosf((float)pos * freq), s = sinf((float)pos * freq);
+            float c = cos_row[i], s = sin_row[i];
             float v0 = vh[i], v1 = vh[i + half];
             vh[i]        = v0 * c - v1 * s;
             vh[i + half] = v0 * s + v1 * c;
@@ -403,7 +444,7 @@ static void attn_worker(void *p, int tid, int nt) {
     RunState      *s   = a->s;
     int l = a->layer, pos = a->pos;
     int nq    = cfg->n_heads_q, nkv = cfg->n_heads_kv;
-    int hd    = cfg->head_dim,  nkv_d = nkv * hd;
+    int hd    = cfg->head_dim;
     int group = nq / nkv;
     float scale = 1.f / sqrtf((float)hd);
     int h_lo = (tid * nq) / nt, h_hi = ((tid + 1) * nq) / nt;
@@ -414,7 +455,7 @@ static void attn_worker(void *p, int tid, int nt) {
         float *scores = s->attn + h * cfg->max_seq_len;
 
         for (int t = 0; t <= pos; t++) {
-            const float *kt = kv->k + ((size_t)l * cfg->max_seq_len + t) * nkv_d + kv_h * hd;
+            const float *kt = kv->k + ((size_t)l * nkv * cfg->max_seq_len + kv_h * cfg->max_seq_len + t) * hd;
             __m256 acc = _mm256_setzero_ps();
             int i = 0;
             for (; i <= hd - 8; i += 8)
@@ -428,7 +469,7 @@ static void attn_worker(void *p, int tid, int nt) {
         float *oh = s->attn_out + h * hd;
         memset(oh, 0, hd * sizeof(float));
         for (int t = 0; t <= pos; t++) {
-            const float *vt = kv->v + ((size_t)l * cfg->max_seq_len + t) * nkv_d + kv_h * hd;
+            const float *vt = kv->v + ((size_t)l * nkv * cfg->max_seq_len + kv_h * cfg->max_seq_len + t) * hd;
             __m256 vs = _mm256_set1_ps(scores[t]);
             int i = 0;
             for (; i <= hd - 8; i += 8)
@@ -448,7 +489,6 @@ static float *forward(Engine *e, int token, int pos) {
     int nq    = cfg->n_heads_q;
     int nkv   = cfg->n_heads_kv;
     int hd    = cfg->head_dim;
-    int nkv_d = nkv * hd;
 
     {
         int nb = dm / 32;
@@ -461,22 +501,23 @@ static float *forward(Engine *e, int token, int pos) {
     }
 
     for (int l = 0; l < cfg->n_layers; l++) {
-        // Attention block
         rms_norm(s->xb, s->x, w->layer[l].attn_norm, dm, cfg->rms_norm_eps);
 
-        par_gemv(s->q,     &w->layer[l].attn_q_w, s->xb);
-        par_gemv(s->k_cur, &w->layer[l].attn_k_w, s->xb);
-        par_gemv(s->v_cur, &w->layer[l].attn_v_w, s->xb);
+        par_qkv(s->q, s->k_cur, s->v_cur,
+                &w->layer[l].attn_q_w, &w->layer[l].attn_k_w, &w->layer[l].attn_v_w,
+                s->xb);
 
         norm_rope_heads(s->q,     nq,  hd, w->layer[l].attn_q_norm,
-                        cfg->rms_norm_eps, pos, cfg->rope_freq_base);
+                        cfg->rms_norm_eps, pos, s->rope_cos, s->rope_sin, hd / 2);
         norm_rope_heads(s->k_cur, nkv, hd, w->layer[l].attn_k_norm,
-                        cfg->rms_norm_eps, pos, cfg->rope_freq_base);
+                        cfg->rms_norm_eps, pos, s->rope_cos, s->rope_sin, hd / 2);
 
-        float *kc = kv->k + ((size_t)l * cfg->max_seq_len + pos) * nkv_d;
-        float *vc = kv->v + ((size_t)l * cfg->max_seq_len + pos) * nkv_d;
-        memcpy(kc, s->k_cur, nkv_d * sizeof(float));
-        memcpy(vc, s->v_cur, nkv_d * sizeof(float));
+        for (int kv_h = 0; kv_h < nkv; kv_h++) {
+            float *kc = kv->k + ((size_t)l * nkv * cfg->max_seq_len + kv_h * cfg->max_seq_len + pos) * hd;
+            float *vc = kv->v + ((size_t)l * nkv * cfg->max_seq_len + kv_h * cfg->max_seq_len + pos) * hd;
+            memcpy(kc, s->k_cur + kv_h * hd, hd * sizeof(float));
+            memcpy(vc, s->v_cur + kv_h * hd, hd * sizeof(float));
+        }
 
         AttnArg aa = { cfg, kv, s, l, pos };
         tp_run(attn_worker, &aa);
@@ -565,6 +606,8 @@ Engine *engine_load(const char *model_path) {
 #undef TF32
     }
 
+    posix_madvise(e->mmap_base, e->mmap_size, POSIX_MADV_RANDOM);
+
     const gguf_value_t *tv = gguf_get_val(ctx, "tokenizer.ggml.tokens");
     const gguf_value_t *mv = gguf_get_val(ctx, "tokenizer.ggml.merges");
     int vocab_size = (int)tv->array.len, n_merges = (int)mv->array.len;
@@ -587,10 +630,28 @@ Engine *engine_load(const char *model_path) {
     s->k_cur    = malloc(nkv_d   * sizeof(float));
     s->v_cur    = malloc(nkv_d   * sizeof(float));
     s->attn     = calloc(nq * ml,  sizeof(float));
-    s->attn_out = calloc(dm,       sizeof(float));
+    s->attn_out = calloc(nq * hd,  sizeof(float));
     s->ffn_out  = malloc(dff     * sizeof(float));
     s->tmp      = malloc(dm      * sizeof(float));
     s->logits   = malloc(vs      * sizeof(float));
+
+    {
+        int half = hd / 2;
+        size_t rope_sz = (size_t)ml * half;
+        s->rope_cos = malloc(rope_sz * sizeof(float));
+        s->rope_sin = malloc(rope_sz * sizeof(float));
+        for (int p = 0; p < ml; p++) {
+            float *cos_row = s->rope_cos + (size_t)p * half;
+            float *sin_row = s->rope_sin + (size_t)p * half;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.f / powf(c->rope_freq_base,
+                                        2.f * (float)i / (float)hd);
+                float angle = (float)p * freq;
+                cos_row[i] = cosf(angle);
+                sin_row[i] = sinf(angle);
+            }
+        }
+    }
 
     KVCache *kv = &e->kv;
     kv->n_layers = c->n_layers; kv->max_seq_len = c->max_seq_len;
@@ -613,11 +674,12 @@ const char *engine_decode_token(Engine *e, int token_id) {
 
 void engine_generate(Engine *e, const char *prompt,
                      TokenCallback cb, void *cb_ctx) {
-    int tokens[4096];
+    int *tokens = malloc((size_t)e->cfg.max_seq_len * sizeof(int));
     int n = tok_encode(&e->tok, prompt, tokens);
     float *logits = NULL;
     double t0 = now_ms();
     for (int i = 0; i < n; i++) logits = forward(e, tokens[i], e->pos++);
+    free(tokens);
     e->prefill_tokens += n;
     e->prefill_ms     += now_ms() - t0;
 
@@ -657,6 +719,7 @@ void engine_free(Engine *e) {
     free(e->s.k_cur); free(e->s.v_cur);
     free(e->s.attn); free(e->s.attn_out);
     free(e->s.ffn_out); free(e->s.tmp); free(e->s.logits);
+    free(e->s.rope_cos); free(e->s.rope_sin);
     free(e->kv.k); free(e->kv.v);
     free(e->tok.vocab);
     tok_free(&e->tok);
